@@ -93,7 +93,6 @@ class TodoItem(BaseModel):
 class ExecutionMode(BaseModel):
     """Execution mode configuration"""
     mode: Literal["single", "parallel"] = "single"
-    max_parallel_agents: int = 5
     reason: str = Field(description="LLM reasoning for mode selection")
 
 
@@ -285,14 +284,12 @@ def parse_execution_planning_response(response_text: str) -> ExecutionMode:
     """Parse execution planning JSON response"""
     fallback = {
         "execution_mode": "single",
-        "max_parallel_agents": 3,
         "reasoning": "Default single mode"
     }
     result = parse_json_response(response_text, fallback)
 
     return ExecutionMode(
         mode=result.get("execution_mode", "single"),
-        max_parallel_agents=result.get("max_parallel_agents", 3),
         reason=result.get("reasoning", "Default execution mode")
     )
 
@@ -645,7 +642,6 @@ async def _supervisor_agent_node_impl(state: VibeSurfState) -> VibeSurfState:
                 
                 state.execution_mode = ExecutionMode(
                     mode=task_type,
-                    max_parallel_agents=5 if task_type == "parallel" else 1,
                     reason=reasoning
                 )
                 state.pending_tasks = tasks_to_execute_new
@@ -842,7 +838,7 @@ async def execute_parallel_browser_tasks(state: VibeSurfState) -> List[BrowserTa
 
     # Register agents with browser manager
     agents = []
-    pending_tasks = state.pending_tasks[:state.execution_mode.max_parallel_agents]
+    pending_tasks = state.pending_tasks
     bu_agent_ids = []
     register_sessions = []
     for i, task in enumerate(pending_tasks):
@@ -888,7 +884,8 @@ async def execute_parallel_browser_tasks(state: VibeSurfState) -> List[BrowserTa
                 task_id=f"{state.task_id}-{i + 1}",
                 file_system_path=state.task_dir,
                 register_new_step_callback=step_callback,
-                extend_system_message="Please make sure the language of your output in JSON value should remain the same as the user's request or task."
+                extend_system_message="Please make sure the language of your output in JSON value should remain the same as the user's request or task.",
+                preload=False
             )
             agents.append(agent)
 
@@ -1040,6 +1037,7 @@ async def execute_single_browser_tasks(state: VibeSurfState) -> List[BrowserTask
                 task_id=f"{state.task_id}-{i}",
                 file_system_path=state.task_dir,
                 register_new_step_callback=step_callback,
+                preload=False,
                 extend_system_message="Please make sure the language of your output in JSON values should remain the same as the user's request or task."
             )
 
@@ -1626,7 +1624,7 @@ class VibeSurfAgent:
                 # Also try to pause if available as a fallback
                 if agent and hasattr(agent, 'stop'):
                     await agent.stop()
-                    logger.debug(f"⏸️ stop agent {agent_id}")
+                    logger.info(f"⏸️ stop agent {agent_id}")
             except Exception as e:
                 logger.warning(f"⚠️ Failed to stop agent {agent_id}: {e}")
 
@@ -1636,7 +1634,7 @@ class VibeSurfAgent:
             try:
                 if hasattr(agent, 'pause'):
                     await agent.pause()
-                    logger.debug(f"⏸️ Paused agent {agent_id}")
+                    logger.info(f"⏸️ Paused agent {agent_id}")
                     if self._current_state:
                         self._current_state.paused_agents.add(agent_id)
             except Exception as e:
@@ -1648,7 +1646,7 @@ class VibeSurfAgent:
             try:
                 if hasattr(agent, 'resume'):
                     await agent.resume()
-                    logger.debug(f"▶️ Resumed agent {agent_id}")
+                    logger.info(f"▶️ Resumed agent {agent_id}")
                     if self._current_state:
                         self._current_state.paused_agents.discard(agent_id)
             except Exception as e:
@@ -1747,14 +1745,27 @@ class VibeSurfAgent:
 
         except asyncio.CancelledError:
             logger.info("🛑 VibeSurfAgent execution was cancelled")
+            # Add cancellation activity log
+            if agent_activity_logs:
+                activity_entry = {
+                    "agent_name": "VibeSurfAgent",
+                    "agent_status": "cancelled",
+                    "agent_msg": "Task execution was cancelled by user request."
+                }
+                agent_activity_logs.append(activity_entry)
             return f"# Task Execution Cancelled\n\n**Task:** {task}\n\nExecution was stopped by user request."
         except Exception as e:
             logger.error(f"❌ VibeSurfAgent execution failed: {e}")
+            # Add error activity log
+            if agent_activity_logs:
+                activity_entry = {
+                    "agent_name": "VibeSurfAgent",
+                    "agent_status": "error",
+                    "agent_msg": f"Task execution failed: {str(e)}"
+                }
+                agent_activity_logs.append(activity_entry)
             return f"# Task Execution Failed\n\n**Task:** {task}\n\n**Error:** {str(e)}\n\nPlease try again or contact support."
         finally:
-            # Reset state
-            self.save_message_history()
-            self.save_activity_logs()
             if agent_activity_logs:
                 activity_entry = {
                     "agent_name": "VibeSurfAgent",
@@ -1762,6 +1773,9 @@ class VibeSurfAgent:
                     "agent_msg": "Finish Task."
                 }
                 agent_activity_logs.append(activity_entry)
+            # Reset state
+            self.save_message_history()
+            self.save_activity_logs()
             async with self._control_lock:
                 self._current_state = None
                 self._execution_task = None

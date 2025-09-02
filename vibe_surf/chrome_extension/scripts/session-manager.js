@@ -200,12 +200,15 @@ class VibeSurfSessionManager {
       throw new Error('No active session. Please create a session first.');
     }
 
-    const taskPayload = {
-      session_id: this.currentSession.id,
-      ...taskData
-    };
-
     try {
+      console.log('[SessionManager] 🔄 Syncing activity logs before task submission...');
+      await this.syncActivityLogsFromServer();
+
+      const taskPayload = {
+        session_id: this.currentSession.id,
+        ...taskData
+      };
+
       const response = await this.apiClient.submitTask(taskPayload);
       
       // Update current session with task info
@@ -339,7 +342,6 @@ class VibeSurfSessionManager {
     }
 
     try {
-      // ✅ 使用当前logs数量作为message_index，确保获取下一个预期的log
       const requestIndex = this.activityLogs.length;
       
       console.log(`[SessionManager] 🔄 Polling activity at index ${requestIndex}, current logs: ${this.activityLogs.length}`);
@@ -353,8 +355,7 @@ class VibeSurfSessionManager {
       // Check both possible response formats
       const activityLog = response?.activity_log || response?.data?.activity_log;
       const totalAvailable = response?.total_available || response?.data?.total_available;
-      
-      // ✅ 关键逻辑：只有当获取到新log且与上一个不同时才处理
+
       if (response && activityLog) {
         const prevActivityLog = this.activityLogs.length > 0 ? this.activityLogs[this.activityLogs.length - 1] : null;
         
@@ -371,8 +372,8 @@ class VibeSurfSessionManager {
           }
           
           this.activityLogs.push(newLog);
-          
-          console.log(`[SessionManager] ✅ New unique activity received: ${newLog.agent_name} - ${newLog.agent_status}`);
+
+          console.log(`[SessionManager] ✅ New activity received: ${newLog.agent_name} - ${newLog.agent_status}`);
 
           await this.handleActivityUpdate(newLog);
 
@@ -383,8 +384,7 @@ class VibeSurfSessionManager {
           });
 
           // Check if task is completed or terminated
-          const terminalStatuses = ['done', 'completed', 'finished', 'error', 'failed',
-                                  'terminated', 'stopped', 'cancelled', 'aborted'];
+          const terminalStatuses = ['done'];
           
           if (terminalStatuses.includes(newLog.agent_status?.toLowerCase())) {
             this.stopActivityPolling();
@@ -430,7 +430,6 @@ class VibeSurfSessionManager {
     }
   }
 
-  // ✅ 新增：比较两个activity log是否相等的辅助方法
   areLogsEqual(log1, log2) {
     if (!log1 || !log2) return false;
     
@@ -474,6 +473,47 @@ class VibeSurfSessionManager {
       }
     } catch (error) {
       console.error(`[SessionManager] ❌ Failed to sync activity logs:`, error);
+    }
+  }
+
+  async syncActivityLogsFromServer() {
+    if (!this.currentSession) return;
+    
+    try {
+      console.log(`[SessionManager] 🔄 Syncing all activity logs from server for session: ${this.currentSession.id}`);
+      
+      // Get all activity logs from server
+      const response = await this.apiClient.getSessionActivity(this.currentSession.id);
+      
+      // Check both possible response formats
+      const serverLogs = response?.activity_logs || response?.data?.activity_logs || [];
+      
+      if (Array.isArray(serverLogs)) {
+        // 完全同步：用服务器端的logs替换本地logs
+        const previousCount = this.activityLogs.length;
+        
+        // 添加timestamp给没有的logs
+        const processedLogs = serverLogs.map(log => ({
+          ...log,
+          timestamp: log.timestamp || new Date().toISOString()
+        }));
+        
+        this.activityLogs = processedLogs;
+        
+        console.log(`[SessionManager] ✅ Activity logs synced: ${previousCount} -> ${this.activityLogs.length} logs`);
+        
+        // 触发日志加载事件，让UI更新
+        this.emit('activityLogsLoaded', {
+          sessionId: this.currentSession.id,
+          logs: this.activityLogs
+        });
+      } else {
+        console.log(`[SessionManager] 📝 No activity logs found on server for session: ${this.currentSession.id}`);
+        this.activityLogs = [];
+      }
+    } catch (error) {
+      console.error(`[SessionManager] ❌ Failed to sync activity logs from server:`, error);
+      // 不抛出错误，允许任务提交继续进行
     }
   }
 

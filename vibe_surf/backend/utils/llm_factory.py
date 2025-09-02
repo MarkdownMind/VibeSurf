@@ -41,17 +41,34 @@ def create_llm_from_profile(llm_profile):
         if not is_provider_supported(provider):
             raise ValueError(f"Unsupported provider: {provider}. Supported: {get_supported_providers()}")
         
-        # Common parameters
+        # Define provider-specific parameter support
+        provider_param_support = {
+            "openai": ["temperature"],
+            "anthropic": ["temperature"],
+            "google": ["temperature"],
+            "azure_openai": ["temperature"],
+            "groq": ["temperature"],
+            "ollama": [],
+            "openrouter": ["temperature"],  # OpenRouter doesn't support max_tokens
+            "deepseek": ["temperature"],
+            "aws_bedrock": ["temperature"],
+            "anthropic_bedrock": ["temperature"],
+            "openai_compatible": ["temperature"]
+        }
+        
+        # Build common parameters based on provider support
+        supported_params = provider_param_support.get(provider, [])
         common_params = {}
-        if temperature is not None:
+        
+        if temperature is not None and "temperature" in supported_params:
             common_params["temperature"] = temperature
-        if max_tokens is not None:
+        if max_tokens is not None and "max_tokens" in supported_params:
             common_params["max_tokens"] = max_tokens
-        if top_p is not None:
+        if top_p is not None and "top_p" in supported_params:
             common_params["top_p"] = top_p
-        if frequency_penalty is not None:
+        if frequency_penalty is not None and "frequency_penalty" in supported_params:
             common_params["frequency_penalty"] = frequency_penalty
-        if seed is not None:
+        if seed is not None and "seed" in supported_params:
             common_params["seed"] = seed
         
         # Add provider-specific config if available
