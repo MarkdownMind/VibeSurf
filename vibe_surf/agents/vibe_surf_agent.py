@@ -32,6 +32,52 @@ from vibe_surf.agents.prompts.vibe_surf_prompt import (
 from vibe_surf.browser.browser_manager import BrowserManager
 from vibe_surf.controller.vibesurf_controller import VibeSurfController
 
+
+# Fix for control character JSON parsing issues in browser-use library
+def sanitize_json_string(json_str: str) -> str:
+    """Remove control characters that cause JSON parsing issues"""
+    if not json_str:
+        return json_str
+    
+    # Remove control characters except tab (0x09), newline (0x0A), and carriage return (0x0D)
+    # which are allowed in JSON strings
+    import re
+    sanitized = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', json_str)
+    return sanitized
+
+
+# Monkey patch JSON loads to sanitize inputs
+def patch_json_parsing():
+    """Patch JSON parsing to handle control characters in responses"""
+    import json
+    import logging
+    
+    # Get logger for this module
+    patch_logger = logging.getLogger(__name__)
+    
+    # Store original json.loads function
+    original_json_loads = json.loads
+    
+    def sanitized_json_loads(s, **kwargs):
+        """JSON loads with control character sanitization"""
+        if isinstance(s, str):
+            s = sanitize_json_string(s)
+        return original_json_loads(s, **kwargs)
+    
+    # Replace json.loads globally (this will affect Pydantic and browser-use)
+    json.loads = sanitized_json_loads
+    
+    patch_logger.info("🔧 Applied JSON sanitization patch for control character handling")
+
+
+# Apply the patch when module loads
+try:
+    patch_json_parsing()
+except Exception as e:
+    # If patching fails, log warning but don't break the module
+    print(f"Warning: Failed to apply JSON sanitization patch: {e}")
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -152,6 +198,10 @@ class VibeSurfState:
     # Agent control tracking
     agent_control_states: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     paused_agents: set = field(default_factory=set)
+    
+    # Loop detection for supervisor agent
+    supervisor_failure_count: int = 0
+    supervisor_last_failure_action: Optional[str] = None
 
     # Control metadata
     control_timestamps: Dict[str, datetime] = field(default_factory=dict)
@@ -173,16 +223,22 @@ def parse_json_response(response_text: str, fallback_data: Dict) -> Dict:
         if json_start >= 0 and json_end > json_start:
             json_text = response_text[json_start:json_end]
             try:
-                return json.loads(json_text)
-            except json.JSONDecodeError:
+                result = json.loads(json_text)
+                logger.debug(f"✅ JSON parsing successful: {result}")
+                return result
+            except json.JSONDecodeError as e:
+                logger.warning(f"🔧 Initial JSON parsing failed: {e}, trying repair...")
                 # Try to repair JSON
                 repaired_json = repair_json(json_text)
-                return json.loads(repaired_json)
+                result = json.loads(repaired_json)
+                logger.debug(f"✅ JSON parsing successful after repair: {result}")
+                return result
 
         # If no JSON found, return fallback
+        logger.warning(f"⚠️ No JSON structure found in response, using fallback. Response: {repr(response_text[:200])}")
         return fallback_data
     except Exception as e:
-        logger.warning(f"JSON parsing failed: {e}, using fallback")
+        logger.warning(f"❌ JSON parsing failed: {e}, using fallback. Response: {repr(response_text[:200])}")
         return fallback_data
 
 
@@ -485,10 +541,41 @@ async def _supervisor_agent_node_impl(state: VibeSurfState) -> VibeSurfState:
         # add result to message history
         supervisor_message_history.append(AssistantMessage(content=response.completion))
 
+        # Debug: Log the raw LLM response to understand parsing issues
+        logger.debug(f"🔍 Raw supervisor LLM response: {repr(response.completion)}")
+        
         supervisor_result = parse_supervisor_response(response.completion)
 
         action = supervisor_result["action"]
         reasoning = supervisor_result["reasoning"]
+        
+        # Detect infinite loop when supervisor keeps failing to parse responses
+        if action == "summary_generation" and "Failed to parse response" in reasoning:
+            state.supervisor_failure_count += 1
+            state.supervisor_last_failure_action = action
+            
+            if state.supervisor_failure_count >= 3:
+                logger.warning(f"🔄 Supervisor agent stuck in parsing loop (failures: {state.supervisor_failure_count})")
+                logger.warning("🛑 Breaking loop by generating a simple completion response")
+                
+                # Force completion with a simple response
+                state.simple_response = f"Task processing completed. The system encountered difficulty parsing LLM responses from the Qwen model, but attempted to complete the requested task: '{state.original_task}'"
+                state.is_complete = True
+                state.current_step = "complete"
+                
+                log_agent_activity(state, "supervisor_agent", "result", 
+                                   f"Loop detected - forced completion: {state.simple_response}")
+                
+                return state
+        else:
+            # Reset failure count on successful parsing
+            if action != "summary_generation" or "Failed to parse response" not in reasoning:
+                state.supervisor_failure_count = 0
+                state.supervisor_last_failure_action = None
+        
+        # Debug: Log what was parsed
+        logger.debug(f"🔍 Parsed supervisor result: {supervisor_result}")
+        
         # Log agent activity
         log_agent_activity(state, "supervisor_agent", "thinking", f"{reasoning}")
 
@@ -834,15 +921,40 @@ async def execute_parallel_browser_tasks(state: VibeSurfState) -> List[BrowserTa
                 log_agent_activity(state, f"browser_use_agent-{i + 1}-{state.task_id[-4:]}", "error",
                                    f"Task failed: {str(history)}")
             else:
+                # Ensure is_successful() returns a boolean, defaulting to False if None
+                success = history.is_successful()
+                if success is None:
+                    logger.warning(f"⚠️ history.is_successful() returned None for agent {i + 1}, defaulting to False")
+                    success = False
+                
+                # Get result text with better error handling
+                result_text = "Task completed"
+                if hasattr(history, 'final_result'):
+                    try:
+                        result_text = history.final_result() or "Task completed"
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to get final_result() for agent {i + 1}: {e}")
+                        result_text = "Task completed (result extraction failed)"
+
+                # Get error information with better error handling
+                error_text = ""
+                if history.has_errors() and not success:
+                    try:
+                        errors = history.errors()
+                        error_text = str(errors) if errors else "Unknown error"
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to get errors() for agent {i + 1}: {e}")
+                        error_text = "Error details unavailable"
+                
                 results.append(BrowserTaskResult(
                     agent_id=f"agent-{i + 1}",
                     task=pending_tasks[i],
-                    success=history.is_successful(),
-                    result=history.final_result() if hasattr(history, 'final_result') else "Task completed",
-                    error=str(history.errors()) if history.has_errors() and not history.is_successful() else ""
+                    success=success,
+                    result=result_text,
+                    error=error_text
                 ))
                 # Log result
-                if history.is_successful():
+                if success:
                     result_text = history.final_result() if hasattr(history, 'final_result') else "Task completed"
                     log_agent_activity(state, f"browser_use_agent-{i + 1}-{state.task_id[-4:]}", "result",
                                        f"Task completed successfully: \n{result_text}")
@@ -881,6 +993,27 @@ async def execute_single_browser_tasks(state: VibeSurfState) -> List[BrowserTask
         log_agent_activity(state, f"browser_use_agent-{state.task_id[-4:]}", "working", f"{task_description}")
 
         try:
+            # Verify browser state before starting agent
+            try:
+                logger.debug(f"🔍 Verifying browser state before starting agent...")
+                target_id = await state.browser_manager._get_active_target()
+                logger.debug(f"🔍 Active target: {target_id}")
+                
+                # Try to get browser state to ensure it's accessible
+                browser_state = await state.browser_manager.main_browser_session.get_browser_state_summary()
+                if browser_state is None:
+                    raise RuntimeError("Browser state is None")
+                if browser_state.dom_state is None:
+                    logger.warning("⚠️ Browser DOM state is None")
+                if browser_state.dom_state and browser_state.dom_state.selector_map is None:
+                    logger.warning("⚠️ Browser selector_map is None")
+                
+                logger.debug(f"🔍 Browser state verified - URL: {browser_state.url}, DOM elements: {len(browser_state.dom_state.selector_map) if browser_state.dom_state and browser_state.dom_state.selector_map else 0}")
+                
+            except Exception as e:
+                logger.error(f"❌ Browser state verification failed: {e}")
+                raise RuntimeError(f"Cannot verify browser state before task execution: {e}")
+            
             await state.browser_manager._get_active_target()
             if state.upload_files:
                 upload_files_md = format_upload_files_list(state.upload_files)
@@ -890,6 +1023,14 @@ async def execute_single_browser_tasks(state: VibeSurfState) -> List[BrowserTask
             # Create step callback for this agent
             agent_name = f"browser_use_agent-{state.task_id[-4:]}"
             step_callback = create_browser_agent_step_callback(state, agent_name)
+            
+            # Debug LLM information
+            llm_model = getattr(state.llm, 'model', 'unknown') if state.llm else 'none'
+            logger.debug(f"🤖 Creating BrowserUseAgent with LLM model: {llm_model}")
+            
+            # Add extra debugging for DeepSeek models
+            if 'deepseek' in llm_model.lower():
+                logger.warning(f"⚠️ Using DeepSeek model: {llm_model}. This may require special handling.")
             
             agent = BrowserUseAgent(
                 task=bu_task,
@@ -908,14 +1049,55 @@ async def execute_single_browser_tasks(state: VibeSurfState) -> List[BrowserTask
                 logger.debug(f"🔗 Registered single agent {agent_id} for control coordination")
 
             try:
-                history = await agent.run()
+                logger.debug(f"🤖 Starting browser-use agent for task: {bu_task}")
+                
+                # Wrap agent.run() with better error handling for the specific error
+                try:
+                    history = await agent.run()
+                except TypeError as e:
+                    if "'NoneType' object is not subscriptable" in str(e):
+                        logger.error(f"❌ Browser-use agent failed with NoneType subscriptable error: {e}")
+                        logger.error("This usually indicates a problem with browser state or LLM response parsing")
+                        raise RuntimeError(f"Browser automation failed - likely due to browser state or LLM response issues: {e}")
+                    else:
+                        raise e
+                except Exception as e:
+                    logger.error(f"❌ Browser-use agent failed with unexpected error: {e}")
+                    raise e
+                
+                logger.debug(f"🤖 Browser-use agent completed, processing results...")
+                
+                # Ensure is_successful() returns a boolean, defaulting to False if None
+                success = history.is_successful()
+                if success is None:
+                    logger.warning(f"⚠️ history.is_successful() returned None, defaulting to False")
+                    success = False
+
+                # Get result text with better error handling
+                result_text = "Task completed"
+                if hasattr(history, 'final_result'):
+                    try:
+                        result_text = history.final_result() or "Task completed"
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to get final_result(): {e}")
+                        result_text = "Task completed (result extraction failed)"
+
+                # Get error information with better error handling
+                error_text = ""
+                if history.has_errors() and not success:
+                    try:
+                        errors = history.errors()
+                        error_text = str(errors) if errors else "Unknown error"
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to get errors(): {e}")
+                        error_text = "Error details unavailable"
 
                 result = BrowserTaskResult(
                     agent_id=agent_id,
                     task=task,
-                    success=history.is_successful(),
-                    result=history.final_result() if hasattr(history, 'final_result') else "Task completed",
-                    error=str(history.errors()) if history.has_errors() and not history.is_successful() else ""
+                    success=success,
+                    result=result_text,
+                    error=error_text
                 )
 
                 # Log result
@@ -1100,7 +1282,7 @@ class VibeSurfAgent:
             logger.info(f"Saving activity logs with {len(self.activity_logs)} sessions to {activity_logs_path}")
             pickle.dump(self.activity_logs, f)
 
-    async def stop(self, reason: str = None) -> ControlResult:
+    async def stop(self, reason: Optional[str] = None) -> ControlResult:
         """
         Stop the vibesurf execution immediately
         
@@ -1165,7 +1347,7 @@ class VibeSurfAgent:
                 details={"error": str(e)}
             )
 
-    async def pause(self, reason: str = None) -> ControlResult:
+    async def pause(self, reason: Optional[str] = None) -> ControlResult:
         """
         Pause the VibeSurf execution
         
@@ -1210,7 +1392,7 @@ class VibeSurfAgent:
                     details={"error": str(e)}
                 )
 
-    async def resume(self, reason: str = None) -> ControlResult:
+    async def resume(self, reason: Optional[str] = None) -> ControlResult:
         """
         Resume the VibeSurf execution
         
@@ -1256,7 +1438,7 @@ class VibeSurfAgent:
                     details={"error": str(e)}
                 )
 
-    async def pause_agent(self, agent_id: str, reason: str = None) -> ControlResult:
+    async def pause_agent(self, agent_id: str, reason: Optional[str] = None) -> ControlResult:
         """
         Pause a specific agent
         
@@ -1305,7 +1487,7 @@ class VibeSurfAgent:
                     details={"agent_id": agent_id, "error": str(e)}
                 )
 
-    async def resume_agent(self, agent_id: str, reason: str = None) -> ControlResult:
+    async def resume_agent(self, agent_id: str, reason: Optional[str] = None) -> ControlResult:
         """
         Resume a specific agent
         
